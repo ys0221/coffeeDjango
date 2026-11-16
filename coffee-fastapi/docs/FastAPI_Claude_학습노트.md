@@ -193,6 +193,189 @@ class Product(Base):                 # Base를 상속 = "이건 DB 테이블이�
     - `[int]`는 Java 제네릭의 `<Integer>`와 같음
     - 객체에서 쓰면 값(`product.id` → 3), 클래스에서 쓰면 컬럼(`Product.price <= 7000` → WHERE 조건)
 
+### 주문 생성 POST /orders (트랜잭션)
+
+요청이 들어와서 응답이 나갈 때까지 5단계를 거친다.
+
+```text
+POST /orders (JSON)
+ ① schemas.py           요청 JSON 검사
+ ② routers/orders.py    서비스에 넘기기 좋게 변환
+ ③ order_service.py     재고 차감 + 주문 저장 (트랜잭션) ⭐
+ ④ routers/orders.py    응답 만들기
+ ⑤ main.py              에러가 났다면 400/404로 바꾸기
+```
+
+**① 요청 JSON 검사 (schemas.py)**
+
+```python
+class OrderItemReq(BaseModel):        # 주문 항목 1개의 양식 (BaseModel 상속 = DTO)
+    product_id: int                   # 상품 번호 (필수, 숫자)
+    quantity: int = Field(ge=1)       # 수량 (필수, 1 이상) = @Min(1)
+
+class OrderCreateReq(BaseModel):      # 주문 요청 전체의 양식
+    customer_email: str = Field(min_length=3)        # 이메일 (3글자 이상)
+    items: list[OrderItemReq] = Field(min_length=1)  # 주문 항목 목록 (최소 1개)
+```
+
+```json
+{
+  "customer_email": "a@test.com",
+  "items": [
+    {"product_id": 1, "quantity": 2},
+    {"product_id": 4, "quantity": 1}
+  ]
+}
+```
+
+- `list[OrderItemReq]` → OrderItemReq 양식의 목록 = Java의 `List<OrderItemReq>`
+- 양식이 틀리면 서비스까지 가지 않고 FastAPI가 바로 422 에러를 돌려준다 (`@Valid` 실패와 같음)
+    - `"quantity": 0`, `"items": []`, `"product_id": "abc"`, 필수값 누락 → 422
+
+**② 서비스에 넘기기 (routers/orders.py)**
+
+```python
+@router.post("", response_model=RsData[list[OrderDto]], status_code=201, summary="주문")
+def create_order(req: OrderCreateReq, db: Session = Depends(get_db)):
+    orders = order_service.create_order(
+        db,
+        req.customer_email,
+        [(i.product_id, i.quantity) for i in req.items],   # → [(1, 2), (4, 1)]
+    )
+```
+
+- `[(i.product_id, i.quantity) for i in req.items]` → 리스트 컴프리헨션으로 (상품번호, 수량) 묶음의 목록을 만든다
+- `(1, 2)`처럼 괄호로 묶은 값 = 튜플 (값 여러 개를 하나로 묶은 것)
+
+**③ ⭐ 재고 차감 + 주문 저장 (services/order_service.py)**
+
+```python
+def create_order(db: Session, customer_email: str, items: list[tuple[int, int]]) -> list[Order]:
+    if not items:                                     # (A) 목록이 비었으면 바로 에러 (= isEmpty())
+        raise BusinessError("주문 항목이 비어 있습니다.")
+
+    now = datetime.now()                              # (B) 주문 시각 (모든 항목에 같은 시각)
+    orders: list[Order] = []
+
+    try:
+        for product_id, quantity in items:            # (C) 튜플을 꺼내서 두 변수에 나눠 담기
+            if quantity < 1:
+                raise BusinessError("수량은 1 이상이어야 합니다.")
+
+            product = db.get(Product, product_id)     # (D) 상품 찾기
+            if product is None:
+                raise NotFoundError(f"{product_id}번 상품을 찾을 수 없습니다.")
+
+            try:                                      # (E) 재고 줄이기
+                product.decrease_stock(quantity)
+            except ValueError as e:
+                raise BusinessError(f"{product.name}: {e} (남은 재고 {product.stock}개)") from e
+
+            order = Order(                            # (F) 주문 객체 만들기 (빌더 불필요)
+                customer_email=customer_email,
+                product_id=product_id,
+                order_date=now,
+                order_state=False,
+                quantity=quantity,
+            )
+            db.add(order)                             # (G) 세션에 "저장 예정"으로 올리기
+            orders.append(order)
+
+        db.commit()                                   # (H) 전부 성공 → DB에 한 번에 반영
+    except Exception:
+        db.rollback()                                 # (I) 하나라도 실패 → 전부 취소
+        raise                                         #     잡은 에러를 그대로 다시 던짐
+
+    for o in orders:                                  # (J) DB가 만든 값(order_id) 다시 읽기
+        db.refresh(o)
+    return orders
+```
+
+- (A) 라우터에서 이미 검사했지만, 이 함수는 Claude Tool에서도 호출하기 때문에 한 번 더 막는다
+- (C) `for product_id, quantity in items` → 반복할 때마다 튜플 하나를 꺼내서 두 변수에 나눠 담는다
+    - 1번째 반복: `product_id = 1, quantity = 2` / 2번째 반복: `product_id = 4, quantity = 1`
+- (E) 재고 부족 `ValueError`를 잡아서 친절한 메시지의 `BusinessError`로 바꿔 던진다
+    - `raise ... from e` → 원래 에러(e)를 원인으로 남겨둠 = Java의 `throw new BusinessException(msg, e);`
+    - `BusinessError`로 바꿔야 ⑤에서 400 응답으로 처리된다
+- (G) `db.add()`는 아직 DB에 들어간 게 아님. 세션(장바구니)에 올려두기만 한 것. 재고 감소도 아직 객체 안에서만 바뀐 상태
+- (H) 반복문이 전부 끝나야 commit까지 온다 → 모아둔 UPDATE, INSERT가 한 번에 DB로
+- (I) `try` 안 어디서든 에러가 나면 여기로 온다
+    - `db.rollback()` → 앞에서 줄인 재고, add한 주문 전부 없던 일로
+    - `raise` (뒤에 아무것도 없음) → 잡은 에러를 그대로 다시 위로 던짐 = Java의 `throw e;`
+    - 여기서 에러를 삼키면 라우터는 성공한 줄 안다
+- (J) `expire_on_commit=False`라서 commit 후 자동으로 다시 읽지 않음 → 자동 증가 `order_id`를 `db.refresh()`로 직접 읽어온다
+- 트랜잭션은 `try`에서 시작되는 게 아니라, 세션이 처음 DB를 쓸 때(`db.get`) 자동으로 시작된다. `try`는 "여기서 에러 나면 롤백"할 범위를 정하는 것
+- ⭐ Spring의 `@Transactional`이 자동으로 해주던 commit/rollback을 직접 쓴 것
+
+**시나리오** (처음 재고: 1번 상품 100개, 4번 상품 2개)
+
+```text
+✅ 성공: [(1, 2), (4, 1)]
+  1번 처리 → 1번 재고 98, 주문1 add          (DB 변화 없음)
+  4번 처리 → 4번 재고 1,  주문2 add          (DB 변화 없음)
+  commit  → DB에 재고 98, 1 + 주문 2건 저장
+
+❌ 실패: [(1, 2), (4, 5)]   ← 4번 재고는 2개뿐
+  1번 처리 → 1번 재고 98, 주문1 add          (DB 변화 없음)
+  4번 처리 → 💥 재고 부족 BusinessError
+  rollback → 1번 재고도 100으로 복구, DB 변화 없음
+```
+
+- 1번 상품의 재고 감소까지 함께 취소되는 것이 트랜잭션의 핵심
+- `tests/test_crud.py`의 `test_order_out_of_stock_rolls_back` 테스트로 확인
+
+**Spring 버전과 차이 (개선한 점)**
+
+- Spring 버전은 컨트롤러에서 `for (OrderDto dto : reqBody) orderService.createOrder(dto);` → 상품마다 트랜잭션을 따로 열었음
+    - 3개 중 3번째가 재고 부족이면 1, 2번째 주문은 이미 저장됨 (일부만 주문되는 문제)
+    - 또 주문을 먼저 저장한 뒤 재고를 확인했음
+- FastAPI 버전은 주문 전체를 하나의 트랜잭션으로 처리 → 하나라도 실패하면 전부 취소
+
+**④ 응답 만들기 (routers/orders.py)**
+
+```python
+    msg = order_service.delivery_message(orders[0].order_date, "주문")
+    return RsData(resultCode="201-1", msg=msg,
+                  data=[OrderDto.model_validate(o) for o in orders])
+```
+
+- `delivery_message` → 오후 2시 기준 배송 안내 문구 (Spring 컨트롤러에 있던 로직 그대로)
+    - 14시 이후: "당일 오후 2시 이후의 주문 건은 다음 날 배송이 시작됩니다."
+    - 14시 이전: "주문이 완료되었습니다. 배송은 금일 시작됩니다."
+- 주문 Entity 목록 → DTO 목록으로 변환해서 `RsData`에 담아 응답
+
+**⑤ 에러를 HTTP 응답으로 (main.py)**
+
+```python
+@app.exception_handler(BusinessError)            # BusinessError가 오면 (@ExceptionHandler)
+async def handle_business(_: Request, e: BusinessError):
+    return JSONResponse(
+        status_code=400,
+        content={"resultCode": "400-1", "msg": str(e), "data": None},
+    )
+```
+
+- ③에서 `raise`로 다시 던진 에러가 라우터를 통과해서 여기로 온다 (`@RestControllerAdvice`와 같음)
+- `str(e)` → 에러 메시지 꺼내기 = Java의 `e.getMessage()`
+- `_` → 사용하지 않는 파라미터라는 Python 관례
+- `NotFoundError`(없는 상품) → 404 / `BusinessError`(재고 부족) → 400
+
+```text
+POST /orders {"customer_email": "a@test.com", "items": [{1, 2}, {4, 5}]}
+ ① 양식 검사 통과
+ ② [(1, 2), (4, 5)] 로 변환해서 서비스 호출
+ ③ 1번 재고 100→98, 주문1 add → 4번 재고 부족 💥 → rollback (1번 재고 100으로 복구) → raise
+ ⑤ BusinessError 잡음 → 400 응답
+ 응답: {"resultCode": "400-1", "msg": "Ethiopia Sidamo: 재고가 부족합니다. (남은 재고 2개)"}
+```
+
+**💡 한계와 개선 방법 (면접 대비)**
+
+- 동시 주문 문제: 두 사람이 동시에 마지막 재고 1개를 주문하면 둘 다 "재고 1개"를 읽고 둘 다 성공할 수 있음 (Spring 버전도 동일)
+- 해결 방법
+    - 비관적 락: 조회할 때 잠금 (`SELECT ... FOR UPDATE`, SQLAlchemy의 `with_for_update()`)
+    - 낙관적 락: 버전 컬럼으로 충돌 감지 (JPA의 `@Version`)
+
 ## 2. Claude Tool Use
 
 ### Step 1. 요청 받기 (routers/chat.py)
